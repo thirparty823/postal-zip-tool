@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#f6f3ed" />
-  <title>郵遞區號一下｜v0.1.1</title>
+  <title>郵遞區號一下｜v0.1.2</title>
   <style>
     :root{
       --bg:#f6f3ed; --card:#fffdf8; --text:#24211d; --muted:#716a61;
@@ -78,7 +78,7 @@
 <main class="wrap">
   <header>
     <h1>郵遞區號一下</h1>
-    <div class="sub">貼上臺灣地址，一次拿到 3 碼、舊制 5 碼與現行 6 碼。v0.1.1</div>
+    <div class="sub">貼上臺灣地址，一次拿到 3 碼、舊制 5 碼與現行 6 碼。v0.1.2</div>
   </header>
 
   <section class="card">
@@ -131,15 +131,17 @@
       <summary>這版怎麼處理地址？</summary>
       <div style="margin-top:8px">
         會統一全形／半形、移除多餘空白，並把「台」正規化成「臺」。
-        原地址若有里、鄰會保留；沒有就不自行補。若完整地址查不到 6 碼，會先移除樓層／室號後再查一次；仍查不到就標示需人工確認，不會猜郵遞區號。
+        原地址若有里、鄰會保留；沒有就不自行補。若主要 API 查不到 6 碼，會解析縣市、行政區、路名、巷、弄與門牌，
+        再用 3+3 門牌區間規則比對單雙號與號碼範圍。只有唯一命中才補入 6 碼；否則標示需人工確認。
       </div>
     </details>
   </section>
 
   <footer>
     <span class="pill">3碼</span><span class="pill">5碼舊制</span><span class="pill">6碼現行</span><br><br>
-    查詢 API：zip5.5432.tw（依中華郵政資料建立的第三方服務）。重要寄件若結果可疑，請以中華郵政正式查詢為準。
-    本工具會在瀏覽器本機快取已查過的地址，避免重複呼叫 API。
+    主要查詢 API：zip5.5432.tw。若 API 沒有回傳 6 碼，v0.1.2 會再讀取 tw-zip 的 3+3 門牌區間資料做第二層比對。
+    只有門牌規則能唯一判定時才補入 6 碼；仍有歧義就不猜。重要寄件若結果可疑，請以中華郵政正式查詢為準。
+    本工具會在瀏覽器本機快取已查過的地址，避免重複查詢。
   </footer>
 </main>
 
@@ -162,17 +164,164 @@ function normalizeInput(s){
     .trim();
 }
 
-// v0.1.1：完整地址查不到 6 碼時，移除樓層／室號資訊後再查一次。
-function stripIndoorDetails(addr){
-  const s = normalizeInput(addr);
-  const idx = s.indexOf('號');
-  if(idx >= 0) return s.slice(0, idx + 1);
 
-  return s
-    .replace(/\d+樓(?:之\d+)?(?:室)?$/,'')
-    .replace(/\d+F(?:-\d+)?$/i,'')
-    .replace(/\d+室$/,'')
-    .trim();
+const ZIP6_RULE_BASE = 'https://raw.githubusercontent.com/supra126/tw-zip/main/data/zip6/';
+const zip6CityCache = new Map();
+
+function parseAddressForZip6(addr){
+  const s = normalizeInput(addr);
+  const cityMatch = s.match(/^(臺北市|新北市|桃園市|臺中市|臺南市|高雄市|基隆市|新竹市|嘉義市|新竹縣|苗栗縣|彰化縣|南投縣|雲林縣|嘉義縣|屏東縣|宜蘭縣|花蓮縣|臺東縣|澎湖縣|金門縣|連江縣)/);
+  if(!cityMatch) return null;
+  const city = cityMatch[1];
+
+  const rest = s.slice(city.length);
+  const areaMatch = rest.match(/^(.+?(?:區|鄉|鎮|市))/);
+  if(!areaMatch) return null;
+  const area = areaMatch[1];
+  const body = rest.slice(area.length);
+
+  const laneMatch = body.match(/(\d+)巷/);
+  const alleyMatch = body.match(/(\d+)弄/);
+  const numberMatch = body.match(/(\d+)(?:之(\d+))?號/);
+  if(!numberMatch) return null;
+
+  const cutPositions = [numberMatch.index];
+  if(laneMatch) cutPositions.push(laneMatch.index);
+  if(alleyMatch) cutPositions.push(alleyMatch.index);
+  const road = body.slice(0, Math.min(...cutPositions));
+
+  if(!road) return null;
+
+  return {
+    city,
+    area,
+    road,
+    lane: laneMatch ? Number(laneMatch[1]) : undefined,
+    alley: alleyMatch ? Number(alleyMatch[1]) : undefined,
+    number: Number(numberMatch[1]),
+    subNumber: numberMatch[2] ? Number(numberMatch[2]) : 0,
+  };
+}
+
+async function loadZip6CityRules(city){
+  if(zip6CityCache.has(city)) return zip6CityCache.get(city);
+  const url = `${ZIP6_RULE_BASE}${encodeURIComponent(city)}.json`;
+  const res = await fetch(url, {cache:'force-cache'});
+  if(!res.ok) throw new Error(`ZIP6 rules HTTP ${res.status}`);
+  const data = await res.json();
+  zip6CityCache.set(city, data);
+  return data;
+}
+
+function parseRuleString(rulesStr){
+  if(!rulesStr) return [];
+  return rulesStr.split('|').map(ruleStr => {
+    const p = ruleStr.split(',');
+    return {
+      suffix: p[0],
+      even: Number(p[1]) || 0,       // 0=全, 1=單, 2=雙
+      lane: Number(p[2]) || 0,
+      laneEnd: Number(p[3]) || 0,
+      alley: Number(p[4]) || 0,
+      alleyEnd: Number(p[5]) || 0,
+      noBegin: Number(p[6]) || 0,
+      noBeginSub: Number(p[7]) || 0,
+      noEnd: Number(p[8]) || 0,
+      noEndSub: Number(p[9]) || 0,
+    };
+  });
+}
+
+function compareDoor(aNo, aSub, bNo, bSub){
+  if(aNo !== bNo) return aNo - bNo;
+  return (aSub || 0) - (bSub || 0);
+}
+
+function ruleMatchesAddress(rule, q){
+  if(rule.lane > 0 || rule.laneEnd > 0){
+    if(q.lane === undefined) return false;
+    if(rule.lane > 0 && rule.laneEnd > 0){
+      if(q.lane < rule.lane || q.lane > rule.laneEnd) return false;
+    }else if(rule.lane > 0 && q.lane !== rule.lane){
+      return false;
+    }
+  }
+
+  if(rule.alley > 0 || rule.alleyEnd > 0){
+    if(q.alley === undefined) return false;
+    if(rule.alley > 0 && rule.alleyEnd > 0){
+      if(q.alley < rule.alley || q.alley > rule.alleyEnd) return false;
+    }else if(rule.alley > 0 && q.alley !== rule.alley){
+      return false;
+    }
+  }
+
+  if(rule.even === 1 && q.number % 2 === 0) return false;
+  if(rule.even === 2 && q.number % 2 === 1) return false;
+
+  if(rule.noBegin > 0 && compareDoor(q.number, q.subNumber, rule.noBegin, rule.noBeginSub) < 0){
+    return false;
+  }
+
+  if(rule.noEnd > 0 && rule.noEnd !== 9998 && rule.noEnd !== 9999){
+    if(compareDoor(q.number, q.subNumber, rule.noEnd, rule.noEndSub) > 0){
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function ruleSpecificity(rule){
+  let score = 0;
+  if(rule.lane > 0 || rule.laneEnd > 0) score += 8;
+  if(rule.alley > 0 || rule.alleyEnd > 0) score += 8;
+  if(rule.noBegin > 0 || rule.noEnd > 0) score += 4;
+  if(rule.noBeginSub > 0 || rule.noEndSub > 0) score += 2;
+  if(rule.even !== 0) score += 1;
+  return score;
+}
+
+async function lookupZip6ByRange(addr, zip3){
+  const q = parseAddressForZip6(addr);
+  if(!q || !zip3 || !/^\d{3}$/.test(zip3)) return null;
+
+  const cityData = await loadZip6CityRules(q.city);
+  const areaData = cityData?.[q.area];
+  if(!areaData) return null;
+
+  let road = q.road;
+  let rulesStr = areaData[road];
+
+  // 少數地址路名會因「臺/台」或資料標準化不同而找不到，僅做完全等價字形嘗試。
+  if(!rulesStr){
+    const alt = road.replace(/臺/g,'台');
+    if(alt !== road && areaData[alt]){
+      road = alt;
+      rulesStr = areaData[alt];
+    }
+  }
+  if(!rulesStr) return null;
+
+  const matches = parseRuleString(rulesStr)
+    .filter(rule => ruleMatchesAddress(rule, q))
+    .map(rule => ({rule, score: ruleSpecificity(rule), zipcode: zip3 + rule.suffix}));
+
+  if(!matches.length) return null;
+
+  const bestScore = Math.max(...matches.map(x => x.score));
+  const best = matches.filter(x => x.score === bestScore);
+  const uniqueZipcodes = [...new Set(best.map(x => x.zipcode))];
+
+  // 安全邊界：只有最高特異度規則得到唯一郵遞區號才回傳。
+  if(uniqueZipcodes.length !== 1) return null;
+
+  return {
+    zipcode: uniqueZipcodes[0],
+    parsed: q,
+    roadMatched: road,
+    matchedCount: best.length
+  };
 }
 
 function cleanReturnedAddress(s){
@@ -180,7 +329,7 @@ function cleanReturnedAddress(s){
   return String(s).replace(/^\s*\d{3,6}\s*/, '').trim();
 }
 
-function cacheKey(addr){ return 'postal-v011:' + addr; }
+function cacheKey(addr){ return 'postal-v012:' + addr; }
 
 function setStatus(msg, kind=''){
   statusEl.textContent = msg;
@@ -231,29 +380,35 @@ async function query(){
 
   const cached = localStorage.getItem(cacheKey(originalAddr));
   if(cached){
-    try { showData(JSON.parse(cached), 'cache'); return; } catch(e){}
+    try {
+      const cachedData = JSON.parse(cached);
+      showData(cachedData, 'cache');
+      if(cachedData._rangeFallback){
+        setStatus(`查詢完成（本機快取）・6碼 ${cachedData.zipcode6} 由門牌區間規則取得。`, 'ok');
+      }
+      return;
+    } catch(e){}
   }
 
   queryBtn.disabled = true;
   setStatus('查詢中…');
 
   try{
+    // 第一層：原本的單筆地址 API，繼續負責 5 碼與可直接取得的 6 碼。
     let data = await fetchPostal(originalAddr);
-    let usedFallback = false;
-    let lookupAddr = originalAddr;
+    const zip3 = String(data.zipcode6 || data.zipcode || '').trim().slice(0,3);
+    let rangeFallback = null;
 
+    // 第二層：API 沒有 6 碼時，改用門牌區間資料比對。
     if(!String(data.zipcode6 || '').trim()){
-      const stripped = stripIndoorDetails(originalAddr);
-
-      if(stripped && stripped !== originalAddr){
-        setStatus('完整地址未取得 6 碼，正在移除樓層／室號後重查…');
-        const retry = await fetchPostal(stripped);
-
-        if(String(retry.zipcode6 || '').trim()){
-          data = retry;
-          usedFallback = true;
-          lookupAddr = stripped;
+      setStatus('主要查詢沒有回傳 6 碼，正在依門牌區間規則比對…');
+      try{
+        rangeFallback = await lookupZip6ByRange(originalAddr, zip3);
+        if(rangeFallback?.zipcode){
+          data = {...data, zipcode6: rangeFallback.zipcode};
         }
+      }catch(fallbackErr){
+        console.warn('ZIP6 range fallback failed:', fallbackErr);
       }
     }
 
@@ -262,17 +417,24 @@ async function query(){
       adrs: originalAddr,
       new_adrs: originalAddr,
       new_adrs6: originalAddr,
-      _lookupAddr: lookupAddr,
-      _fallback: usedFallback
+      _rangeFallback: Boolean(rangeFallback?.zipcode),
+      _rangeParsed: rangeFallback?.parsed || null,
     };
 
     localStorage.setItem(cacheKey(originalAddr), JSON.stringify(displayData));
     showData(displayData);
 
-    if(usedFallback){
-      setStatus(`查詢完成・6碼以門牌地址「${lookupAddr}」重查取得；完整樓層地址已保留。`, 'ok');
-    } else if(!String(data.zipcode6 || '').trim()){
-      setStatus('5碼可取得，但 6 碼仍查不到。可能需要依門牌投遞區間人工確認；本工具不會自行猜值。', 'bad');
+    if(rangeFallback?.zipcode){
+      const p = rangeFallback.parsed;
+      const detail = [
+        p.road,
+        p.lane !== undefined ? `${p.lane}巷` : '',
+        p.alley !== undefined ? `${p.alley}弄` : '',
+        `${p.number}${p.subNumber ? `之${p.subNumber}` : ''}號`
+      ].filter(Boolean).join('');
+      setStatus(`查詢完成・6碼 ${rangeFallback.zipcode} 由門牌區間規則取得（${detail}）。`, 'ok');
+    }else if(!String(data.zipcode6 || '').trim()){
+      setStatus('5碼可取得，但門牌區間規則仍無法唯一判定 6 碼；本工具不會自行猜值，請以中華郵政正式查詢確認。', 'bad');
     }
   }catch(err){
     console.error(err);
