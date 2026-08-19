@@ -4,7 +4,14 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#f6f3ed" />
-  <title>郵遞區號一下｜v0.1.3</title>
+  <title>郵遞區號一下｜v0.1.4</title>
+  <link rel="manifest" href="./manifest.webmanifest" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./apple-touch-icon.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="./favicon-32.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="default" />
+  <meta name="apple-mobile-web-app-title" content="郵遞區號一下" />
+  <meta name="mobile-web-app-capable" content="yes" />
   <style>
     :root{
       --bg:#f6f3ed; --card:#fffdf8; --text:#24211d; --muted:#716a61;
@@ -78,7 +85,7 @@
 <main class="wrap">
   <header>
     <h1>郵遞區號一下</h1>
-    <div class="sub">貼上臺灣地址，一次拿到 3 碼、舊制 5 碼與現行 6 碼。v0.1.3</div>
+    <div class="sub">貼上臺灣地址，一次拿到 3 碼、舊制 5 碼與現行 6 碼。v0.1.4</div>
   </header>
 
   <section class="card">
@@ -381,7 +388,7 @@ function cleanReturnedAddress(s){
   return String(s).replace(/^\s*\d{3,6}\s*/, '').trim();
 }
 
-function cacheKey(addr){ return 'postal-v013:' + addr; }
+function cacheKey(addr){ return 'postal-v014:' + addr; }
 
 function setStatus(msg, kind=''){
   statusEl.textContent = msg;
