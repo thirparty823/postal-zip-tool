@@ -4,7 +4,7 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
   <meta name="theme-color" content="#f6f3ed" />
-  <title>郵遞區號一下｜v0.1.2</title>
+  <title>郵遞區號一下｜v0.1.3</title>
   <style>
     :root{
       --bg:#f6f3ed; --card:#fffdf8; --text:#24211d; --muted:#716a61;
@@ -78,7 +78,7 @@
 <main class="wrap">
   <header>
     <h1>郵遞區號一下</h1>
-    <div class="sub">貼上臺灣地址，一次拿到 3 碼、舊制 5 碼與現行 6 碼。v0.1.2</div>
+    <div class="sub">貼上臺灣地址，一次拿到 3 碼、舊制 5 碼與現行 6 碼。v0.1.3</div>
   </header>
 
   <section class="card">
@@ -132,7 +132,7 @@
       <div style="margin-top:8px">
         會統一全形／半形、移除多餘空白，並把「台」正規化成「臺」。
         原地址若有里、鄰會保留；沒有就不自行補。若主要 API 查不到 6 碼，會解析縣市、行政區、路名、巷、弄與門牌，
-        再用 3+3 門牌區間規則比對單雙號與號碼範圍。只有唯一命中才補入 6 碼；否則標示需人工確認。
+        再用 3+3 門牌區間規則比對單雙號與號碼範圍。若同時命中多條規則，優先採用條件更具體、門牌範圍更窄者；仍無法唯一判定才標示需人工確認。
       </div>
     </details>
   </section>
@@ -140,7 +140,7 @@
   <footer>
     <span class="pill">3碼</span><span class="pill">5碼舊制</span><span class="pill">6碼現行</span><br><br>
     主要查詢 API：zip5.5432.tw。若 API 沒有回傳 6 碼，v0.1.2 會再讀取 tw-zip 的 3+3 門牌區間資料做第二層比對。
-    只有門牌規則能唯一判定時才補入 6 碼；仍有歧義就不猜。重要寄件若結果可疑，請以中華郵政正式查詢為準。
+    重疊規則時優先採用更具體、範圍更窄者；若最高優先級仍有歧義就不猜。重要寄件若結果可疑，請以中華郵政正式查詢為準。
     本工具會在瀏覽器本機快取已查過的地址，避免重複查詢。
   </footer>
 </main>
@@ -272,14 +272,53 @@ function ruleMatchesAddress(rule, q){
   return true;
 }
 
-function ruleSpecificity(rule){
-  let score = 0;
-  if(rule.lane > 0 || rule.laneEnd > 0) score += 8;
-  if(rule.alley > 0 || rule.alleyEnd > 0) score += 8;
-  if(rule.noBegin > 0 || rule.noEnd > 0) score += 4;
-  if(rule.noBeginSub > 0 || rule.noEndSub > 0) score += 2;
-  if(rule.even !== 0) score += 1;
-  return score;
+function ruleRank(rule){
+  // 越具體的地址條件越優先。
+  // 先比較「結構條件」：弄 > 巷 > 明確門牌區間 > 單雙號。
+  let structure = 0;
+  if(rule.alley > 0 || rule.alleyEnd > 0) structure += 1000;
+  if(rule.lane > 0 || rule.laneEnd > 0) structure += 500;
+  if(rule.noBegin > 0 || rule.noEnd > 0) structure += 100;
+  if(rule.noBeginSub > 0 || rule.noEndSub > 0) structure += 20;
+  if(rule.even !== 0) structure += 10;
+
+  // 在相同結構條件下，門牌範圍越窄越具體。
+  // 例如：雙 80~90 應優先於「雙 98 以下」。
+  let width = Number.POSITIVE_INFINITY;
+  if(rule.noBegin > 0 && rule.noEnd > 0 && rule.noEnd !== 9998 && rule.noEnd !== 9999){
+    width = Math.max(0, rule.noEnd - rule.noBegin);
+  }else if(rule.noEnd > 0 && rule.noEnd !== 9998 && rule.noEnd !== 9999){
+    // 「98以下」視為 1~98，範圍較寬。
+    width = Math.max(0, rule.noEnd - 1);
+  }else if(rule.noBegin > 0 && (rule.noEnd === 9998 || rule.noEnd === 9999 || rule.noEnd === 0)){
+    // 「某號以上」是開放區間，優先級低於有限區間。
+    width = Number.POSITIVE_INFINITY;
+  }
+
+  // 巷／弄有明確起訖時也以較窄者優先。
+  let laneWidth = Number.POSITIVE_INFINITY;
+  if(rule.lane > 0 && rule.laneEnd > 0) laneWidth = rule.laneEnd - rule.lane;
+  else if(rule.lane > 0) laneWidth = 0;
+
+  let alleyWidth = Number.POSITIVE_INFINITY;
+  if(rule.alley > 0 && rule.alleyEnd > 0) alleyWidth = rule.alleyEnd - rule.alley;
+  else if(rule.alley > 0) alleyWidth = 0;
+
+  return {structure, width, laneWidth, alleyWidth};
+}
+
+function compareRuleRank(a, b){
+  const ra = ruleRank(a.rule);
+  const rb = ruleRank(b.rule);
+
+  // 結構條件越多越好
+  if(ra.structure !== rb.structure) return rb.structure - ra.structure;
+  // 同層級時，弄／巷／門牌區間越窄越好
+  if(ra.alleyWidth !== rb.alleyWidth) return ra.alleyWidth - rb.alleyWidth;
+  if(ra.laneWidth !== rb.laneWidth) return ra.laneWidth - rb.laneWidth;
+  if(ra.width !== rb.width) return ra.width - rb.width;
+
+  return 0;
 }
 
 async function lookupZip6ByRange(addr, zip3){
@@ -305,22 +344,35 @@ async function lookupZip6ByRange(addr, zip3){
 
   const matches = parseRuleString(rulesStr)
     .filter(rule => ruleMatchesAddress(rule, q))
-    .map(rule => ({rule, score: ruleSpecificity(rule), zipcode: zip3 + rule.suffix}));
+    .map(rule => ({rule, zipcode: zip3 + rule.suffix}));
 
   if(!matches.length) return null;
 
-  const bestScore = Math.max(...matches.map(x => x.score));
-  const best = matches.filter(x => x.score === bestScore);
-  const uniqueZipcodes = [...new Set(best.map(x => x.zipcode))];
+  // v0.1.3：重疊規則時，以「更具體、範圍更窄」者優先。
+  // 例：富民路雙 80~90 號優先於「雙 98 號以下」。
+  matches.sort(compareRuleRank);
+  const best = matches[0];
+  const bestRank = ruleRank(best.rule);
 
-  // 安全邊界：只有最高特異度規則得到唯一郵遞區號才回傳。
+  // 找出與第一名完全同級的規則。
+  const tiedBest = matches.filter(item => {
+    const r = ruleRank(item.rule);
+    return r.structure === bestRank.structure &&
+           r.width === bestRank.width &&
+           r.laneWidth === bestRank.laneWidth &&
+           r.alleyWidth === bestRank.alleyWidth;
+  });
+
+  const uniqueZipcodes = [...new Set(tiedBest.map(x => x.zipcode))];
+
+  // 安全邊界：若最具體的一組規則本身仍導向不同郵遞區號，就不猜。
   if(uniqueZipcodes.length !== 1) return null;
 
   return {
     zipcode: uniqueZipcodes[0],
     parsed: q,
     roadMatched: road,
-    matchedCount: best.length
+    matchedCount: tiedBest.length
   };
 }
 
@@ -329,7 +381,7 @@ function cleanReturnedAddress(s){
   return String(s).replace(/^\s*\d{3,6}\s*/, '').trim();
 }
 
-function cacheKey(addr){ return 'postal-v012:' + addr; }
+function cacheKey(addr){ return 'postal-v013:' + addr; }
 
 function setStatus(msg, kind=''){
   statusEl.textContent = msg;
